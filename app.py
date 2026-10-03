@@ -1,22 +1,12 @@
-import io
+import os
 import joblib
 import numpy as np
-from flask import Flask, render_template, request, jsonify
+import streamlit as st
 from PIL import Image
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024   # 8 MB upload limit
-import os
-MODEL_PATH = "model/zoa_svm.joblib" if os.path.exists("model/zoa_svm.joblib") else "zoa_svm.joblib"
-bundle = joblib.load(MODEL_PATH)
-scaler, mask, svm, classes = (bundle["scaler"], bundle["mask"],
-                              bundle["svm"], bundle["classes"])
-
-# Stage 1: CNN feature extractor
-cnn = MobileNetV2(weights="imagenet", include_top=False,
-                  pooling="avg", input_shape=(224, 224, 3))
+st.set_page_config(page_title="Brain Tumor Classifier", page_icon="🧠")
 
 LABELS = {
     "glioma": "Glioma Tumor",
@@ -25,34 +15,40 @@ LABELS = {
     "pituitary": "Pituitary Tumor",
 }
 
-@app.route("/")
-def home():
-    return render_template("index.html")
+@st.cache_resource
+def load_models():
+    path = "model/zoa_svm.joblib" if os.path.exists("model/zoa_svm.joblib") else "zoa_svm.joblib"
+    bundle = joblib.load(path)
+    cnn = MobileNetV2(weights="imagenet", include_top=False,
+                      pooling="avg", input_shape=(224, 224, 3))
+    return bundle, cnn
 
-@app.route("/predict", methods=["POST"])
-def predict():
-    file = request.files.get("image")
-    if file is None or file.filename == "":
-        return jsonify(error="No image uploaded"), 400
-    try:
-        img = Image.open(io.BytesIO(file.read())).convert("RGB").resize((224, 224))
-    except Exception:
-        return jsonify(error="Invalid image file"), 400
+bundle, cnn = load_models()
+scaler, mask, svm, classes = (bundle["scaler"], bundle["mask"],
+                              bundle["svm"], bundle["classes"])
 
-    arr = preprocess_input(np.array(img, dtype="float32")[None, ...])
-    feats = cnn.predict(arr, verbose=0)               # CNN features (1280)
-    X = scaler.transform(feats)[:, mask]              # ZOA-selected features
-    proba = svm.predict_proba(X)[0]                   # SVM classification
-    k = int(proba.argmax())
+st.title("🧠 Brain Tumor Classification")
+st.caption("Hybrid CNN + Zebra Optimization Algorithm (ZOA) + SVM")
 
-    return jsonify(
-        label=LABELS.get(classes[k], classes[k]),
-        confidence=round(float(proba[k]) * 100, 2),
-        probabilities={LABELS.get(c, c): round(float(p) * 100, 2)
-                       for c, p in zip(classes, proba)},
-        features_used=int(mask.sum()),
-        features_total=int(len(mask)),
-    )
+uploaded = st.file_uploader("Upload a brain MRI image", type=["jpg", "jpeg", "png"])
 
-if __name__ == "__main__":
-    app.run(debug=True)
+if uploaded is not None:
+    img = Image.open(uploaded).convert("RGB")
+    st.image(img, caption="Uploaded MRI", use_container_width=True)
+
+    if st.button("Analyze", type="primary"):
+        with st.spinner("Analyzing..."):
+            arr = preprocess_input(np.array(img.resize((224, 224)), dtype="float32")[None, ...])
+            feats = cnn.predict(arr, verbose=0)          # CNN features (1280)
+            X = scaler.transform(feats)[:, mask]         # ZOA-selected features
+            proba = svm.predict_proba(X)[0]              # SVM classification
+        k = int(proba.argmax())
+
+        st.subheader(LABELS.get(classes[k], classes[k]))
+        st.write(f"Confidence: **{proba[k] * 100:.2f}%**")
+        for c, p in zip(classes, proba):
+            st.write(LABELS.get(c, c))
+            st.progress(float(p))
+        st.caption(f"ZOA selected {int(mask.sum())} of {len(mask)} CNN features.")
+
+st.warning("For research and educational use only. Not a substitute for professional medical diagnosis.")
