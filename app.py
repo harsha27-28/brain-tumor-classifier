@@ -9,7 +9,9 @@ from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024   # 8 MB upload limit
 
-bundle = joblib.load("model/zoa_svm.joblib")
+   import os
+   MODEL_PATH = "model/zoa_svm.joblib" if os.path.exists("model/zoa_svm.joblib") else "zoa_svm.joblib"
+   bundle = joblib.load(MODEL_PATH)
 scaler, mask, svm, classes = (bundle["scaler"], bundle["mask"],
                               bundle["svm"], bundle["classes"])
 
