@@ -1,8 +1,6 @@
-flask==3.0.3
-gunicorn==22.0.0
+streamlit
 tensorflow-cpu==2.15.0
 numpy<2
-# CHANGE this to the sklearn version printed at the end of the Colab training
 scikit-learn==1.6.1
 joblib
 pillow
