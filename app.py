@@ -491,6 +491,7 @@ def estimate_tumor(img, fov_mm):
 
 PAGE_DASH = "🏠 Dashboard"
 PAGE_SCAN = "🧠 MRI Scan"
+PAGE_STATS = "📊 Usage Statistics"
 
 
 # ---------------------------------------------------------------
@@ -588,21 +589,57 @@ def usage_statistics():
                            "usage_log.csv", "text/csv")
 
 
-def go_to_scan():
-    st.session_state["page"] = PAGE_SCAN
+def goto(page):
+    st.session_state["page"] = page
 
 
 def dashboard_page():
-    st.markdown("### 🏠 Dashboard")
-    st.write("Upload a brain MRI to get the tumor classification, an approximate tumor size "
-             "and a report you can share with your doctor.")
-    st.button("➕ Start a new MRI scan", type="primary", use_container_width=True,
-              on_click=go_to_scan)
+    st.markdown(
+        """
+        <style>
+        .nav-card { background: rgba(255,255,255,.07); border: 1px solid rgba(95,212,255,.35);
+                    border-radius: 16px; padding: 1.4rem 1rem 1rem 1rem; text-align: center;
+                    min-height: 190px; }
+        .nav-card .ico { font-size: 2.8rem; }
+        .nav-card h3 { margin: .3rem 0 .4rem 0; }
+        .nav-card p { font-size: .9rem; opacity: .85; margin: 0; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown("### 🏠 Main Dashboard")
+    st.write("Choose what you would like to open:")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(
+            '<div class="nav-card"><div class="ico">🧠</div><h3>MRI Scan</h3>'
+            '<p>Upload an MRI image, PDF or Word file and get the tumor classification, '
+            'approximate size and a report.</p></div>',
+            unsafe_allow_html=True,
+        )
+        st.button("Open MRI Scan", type="primary", use_container_width=True,
+                  on_click=goto, args=(PAGE_SCAN,), key="open_scan")
+    with c2:
+        st.markdown(
+            '<div class="nav-card"><div class="ico">📊</div><h3>Usage Statistics</h3>'
+            '<p>See how many people registered, logged in and analysed scans '
+            '(admin password required).</p></div>',
+            unsafe_allow_html=True,
+        )
+        st.button("Open Usage Statistics", type="primary", use_container_width=True,
+                  on_click=goto, args=(PAGE_STATS,), key="open_stats")
+
+
+def stats_page():
+    if not _secret("ADMIN_PASSWORD"):
+        st.info("Usage statistics are not enabled yet. Add ADMIN_PASSWORD in the app's "
+                "Streamlit Secrets to turn them on.")
+        return
     usage_statistics()
 
 
 def app_shell():
-    """Header + navigation shown after login."""
+    """Header and page routing shown after login."""
     _, top_r = st.columns([4, 1])
     with top_r:
         if st.button("Log out", use_container_width=True):
@@ -612,13 +649,16 @@ def app_shell():
     st.markdown('<div class="brand"><h1>🧠 MRI NeuroScan AI</h1></div>', unsafe_allow_html=True)
     st.markdown('<div class="tagline">Brain tumor MRI classification · CNN + ZOA + SVM</div>',
                 unsafe_allow_html=True)
-    st.session_state.setdefault("page", PAGE_DASH)
-    page = st.radio("Navigation", [PAGE_DASH, PAGE_SCAN], key="page",
-                    horizontal=True, label_visibility="collapsed")
+
+    page = st.session_state.get("page", PAGE_DASH)
     if page == PAGE_DASH:
         dashboard_page()
-    else:
+        return
+    st.button("← Back to Dashboard", on_click=goto, args=(PAGE_DASH,), key="back_home")
+    if page == PAGE_SCAN:
         classifier_page()
+    else:
+        stats_page()
 
 
 def classifier_page():
