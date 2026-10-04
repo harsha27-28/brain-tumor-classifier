@@ -1,5 +1,9 @@
+import io
 import os
+import random
 import re
+import time
+import zipfile
 import base64
 import hashlib
 import hmac
@@ -12,7 +16,7 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 
-st.set_page_config(page_title="NeuroScan AI", page_icon="🧠", layout="centered")
+st.set_page_config(page_title="MRI NeuroScan AI", page_icon="🧠", layout="centered")
 
 LABELS = {
     "glioma": "Glioma Tumor",
@@ -145,11 +149,13 @@ def create_user(full_name, username, email, password):
         return False, "That username or email is already registered."
 
 
-def verify_user(username, password):
+def verify_user(identifier, password):
+    """identifier can be the username or the email address."""
+    ident = identifier.strip().lower()
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT salt, pw_hash, full_name FROM users WHERE username=?",
-            (username.lower(),),
+            "SELECT salt, pw_hash, full_name FROM users WHERE username=? OR email=?",
+            (ident, ident),
         ).fetchone()
     if row and hmac.compare_digest(hash_pw(password, row[0]), row[1]):
         return row[2]
@@ -160,7 +166,7 @@ def verify_user(username, password):
 # Sign in / Sign up page
 # ---------------------------------------------------------------
 def auth_page():
-    st.markdown('<div class="brand"><h1>🧠 NeuroScan AI</h1></div>', unsafe_allow_html=True)
+    st.markdown('<div class="brand"><h1>🧠 MRI NeuroScan AI</h1></div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="tagline">Brain tumor MRI classification · CNN + ZOA + SVM</div>',
         unsafe_allow_html=True,
@@ -169,16 +175,17 @@ def auth_page():
 
     with tab_in:
         with st.form("signin"):
-            u = st.text_input("Username")
+            u = st.text_input("Username or Email")
             p = st.text_input("Password", type="password")
             go = st.form_submit_button("Sign In", use_container_width=True)
         if go:
             name = verify_user(u.strip(), p) if u.strip() and p else None
             if name:
                 st.session_state["user"] = name
+                st.session_state["show_welcome"] = True
                 st.rerun()
             else:
-                st.error("Invalid username or password.")
+                st.error("Invalid username/email or password.")
 
     with tab_up:
         with st.form("signup"):
@@ -207,7 +214,7 @@ def auth_page():
 
 
 # ---------------------------------------------------------------
-# Classifier page (shown after login)
+# Model loading
 # ---------------------------------------------------------------
 @st.cache_resource
 def load_models():
@@ -220,18 +227,204 @@ def load_models():
     return bundle, cnn
 
 
+# ---------------------------------------------------------------
+# Reading uploaded files: images, PDF, Word (.docx)
+# ---------------------------------------------------------------
+UPLOAD_TYPES = ["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp", "pdf", "docx", "doc"]
+MIN_SIDE = 64      # ignore tiny images such as logos/icons
+MAX_IMAGES = 12
+
+
+def images_from_file(uploaded):
+    """Return a list of RGB PIL images found in the uploaded file."""
+    name = uploaded.name.lower()
+    data = uploaded.getvalue()
+    images = []
+
+    if name.endswith(".pdf"):
+        import fitz  # PyMuPDF
+        doc = fitz.open(stream=data, filetype="pdf")
+        for page in doc:
+            for item in page.get_images(full=True):
+                try:
+                    pix = fitz.Pixmap(doc, item[0])
+                    if pix.n - pix.alpha >= 4:
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    images.append(Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB"))
+                except Exception:
+                    pass
+            if len(images) >= MAX_IMAGES:
+                break
+        if not [im for im in images if min(im.size) >= MIN_SIDE]:
+            images = []
+            for page in list(doc)[:3]:          # scanned/vector PDF: render pages
+                pix = page.get_pixmap(dpi=150)
+                images.append(Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB"))
+
+    elif name.endswith(".docx"):
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            for n in z.namelist():
+                if n.startswith("word/media/"):
+                    try:
+                        images.append(Image.open(io.BytesIO(z.read(n))).convert("RGB"))
+                    except Exception:
+                        pass                      # skip unsupported formats (emf/wmf)
+
+    elif name.endswith(".doc"):
+        raise ValueError("Old .doc files are not supported. Open it in Word, "
+                         "choose Save As > .docx (or PDF), and upload that file.")
+    else:
+        images.append(Image.open(io.BytesIO(data)).convert("RGB"))
+
+    return [im for im in images if min(im.size) >= MIN_SIDE][:MAX_IMAGES]
+
+
+# ---------------------------------------------------------------
+# Approximate tumor size (simple image-processing estimate)
+# ---------------------------------------------------------------
+def _otsu(values):
+    if values.size < 50:
+        return float(values.mean()) if values.size else 0.0
+    hist, edges = np.histogram(values, bins=128)
+    hist = hist.astype(float)
+    centers = (edges[:-1] + edges[1:]) / 2
+    w1 = np.cumsum(hist)
+    w2 = w1[-1] - w1
+    s = np.cumsum(hist * centers)
+    m1 = s / np.maximum(w1, 1e-9)
+    m2 = (s[-1] - s) / np.maximum(w2, 1e-9)
+    var = w1 * w2 * (m1 - m2) ** 2
+    return float(centers[int(np.argmax(var[:-1]))])
+
+
+def estimate_tumor(img, fov_mm):
+    """Rough tumor size from the brightest connected region inside the brain.
+    Returns None if nothing reliable is found."""
+    from scipy import ndimage as ndi
+
+    W, H = img.size
+    N = 256
+    gray = np.asarray(img.convert("L").resize((N, N)), dtype=float)
+    gray = ndi.gaussian_filter(gray, 1.0)
+    g = gray / max(gray.max(), 1.0)
+
+    head = ndi.binary_fill_holes(ndi.binary_opening(g > 0.10, iterations=2))
+    lab, n = ndi.label(head)
+    if n == 0:
+        return None
+    sizes = ndi.sum(head, lab, range(1, n + 1))
+    head = lab == (int(np.argmax(sizes)) + 1)
+    brain = ndi.binary_erosion(head, iterations=12)      # drop skull edge
+    if brain.sum() < 2000:
+        return None
+
+    vals = g[brain]
+    t1 = _otsu(vals)
+    t2 = _otsu(vals[vals > t1])
+    cand = ndi.binary_opening(brain & (g > t2), iterations=2)
+    lab, n = ndi.label(cand)
+    if n == 0:
+        return None
+    sizes = ndi.sum(cand, lab, range(1, n + 1))
+    idx = int(np.argmax(sizes)) + 1
+    comp = lab == idx
+    area_px = float(comp.sum())
+    if area_px < 0.002 * brain.sum():
+        return None
+
+    mm_x = fov_mm / N                      # image width spans the field of view
+    mm_y = fov_mm * (H / W) / N            # assume square pixels
+    area_mm2 = area_px * mm_x * mm_y
+    diameter = 2.0 * np.sqrt(area_mm2 / np.pi)
+    sl = ndi.find_objects(comp.astype(int))[0]
+    ext_y = (sl[0].stop - sl[0].start) * mm_y
+    ext_x = (sl[1].stop - sl[1].start) * mm_x
+
+    base = np.asarray(img.resize((N, N)).convert("RGB")).copy()
+    edge = comp & ~ndi.binary_erosion(comp, iterations=2)
+    base[edge] = [255, 60, 60]
+    return {
+        "diameter_mm": float(diameter),
+        "extent_mm": (float(ext_x), float(ext_y)),
+        "area_mm2": float(area_mm2),
+        "pct_brain": 100.0 * area_px / float(brain.sum()),
+        "overlay": Image.fromarray(base).resize((384, 384)),
+    }
+
+
+# ---------------------------------------------------------------
+# Full-screen glittering welcome (shown once right after sign in)
+# ---------------------------------------------------------------
+def welcome_screen(name):
+    rnd = random.Random(7)
+    sparks = []
+    for _ in range(110):
+        s = rnd.uniform(2, 7)
+        sparks.append(
+            f'<span class="sp" style="left:{rnd.uniform(0, 100):.1f}%;top:{rnd.uniform(0, 100):.1f}%;'
+            f'width:{s:.1f}px;height:{s:.1f}px;animation-delay:{rnd.uniform(0, 3):.2f}s;'
+            f'animation-duration:{rnd.uniform(1.2, 3):.2f}s"></span>'
+        )
+    safe_name = name.replace("<", "").replace(">", "")
+    st.markdown(
+        f"""
+        <style>
+        .welcome-overlay {{
+            position: fixed; inset: 0; z-index: 99999999;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            background: radial-gradient(circle at 50% 40%, #14407f 0%, #07152b 55%, #030a16 100%);
+            overflow: hidden; animation: fadein .6s ease-out;
+        }}
+        @keyframes fadein {{ from {{ opacity: 0 }} to {{ opacity: 1 }} }}
+        .sp {{
+            position: absolute; border-radius: 50%; background: #fff; opacity: 0;
+            box-shadow: 0 0 10px 3px rgba(255,215,120,.9);
+            animation-name: twinkle; animation-iteration-count: infinite; animation-timing-function: ease-in-out;
+        }}
+        @keyframes twinkle {{ 0%,100% {{ opacity: 0; transform: scale(.3) }} 50% {{ opacity: 1; transform: scale(1.5) }} }}
+        .w-brain {{ font-size: 4.5rem; animation: pulse 1.6s ease-in-out infinite; z-index: 2; }}
+        @keyframes pulse {{ 0%,100% {{ transform: scale(1) }} 50% {{ transform: scale(1.15) }} }}
+        .w-title {{
+            z-index: 2; font-size: clamp(2.4rem, 8vw, 5.5rem); font-weight: 800; letter-spacing: .04em;
+            background: linear-gradient(90deg, #ffe29a, #ffffff, #ffd36b, #ffffff, #ffe29a);
+            background-size: 200% auto; -webkit-background-clip: text; background-clip: text;
+            -webkit-text-fill-color: transparent; animation: shine 2.4s linear infinite;
+        }}
+        @keyframes shine {{ to {{ background-position: 200% center }} }}
+        .w-name {{ z-index: 2; font-size: clamp(1.4rem, 4vw, 2.4rem); color: #bfe9ff; margin-top: .3rem; }}
+        .w-sub {{ z-index: 2; margin-top: 1.2rem; color: #8fd8ff; letter-spacing: .25em; font-size: .95rem; text-transform: uppercase; }}
+        </style>
+        <div class="welcome-overlay">
+            {''.join(sparks)}
+            <div class="w-brain">🧠</div>
+            <div class="w-title">Welcome</div>
+            <div class="w-name">{safe_name}</div>
+            <div class="w-sub">MRI NeuroScan AI</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    time.sleep(3.5)
+    st.rerun()
+
+
+# ---------------------------------------------------------------
+# Classifier page (shown after login)
+# ---------------------------------------------------------------
 def classifier_page():
     from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 
-    with st.sidebar:
-        st.markdown(f"### 👋 Welcome, {st.session_state['user']}")
+    _, top_r = st.columns([4, 1])
+    with top_r:
         if st.button("Log out", use_container_width=True):
-            del st.session_state["user"]
+            st.session_state.pop("user", None)
+            st.session_state.pop("pred", None)
             st.rerun()
 
-    st.markdown('<div class="brand"><h1>🧠 NeuroScan AI</h1></div>', unsafe_allow_html=True)
+    st.markdown('<div class="brand"><h1>🧠 MRI NeuroScan AI</h1></div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="tagline">Upload a brain MRI image for automated tumor classification</div>',
+        '<div class="tagline">Upload a brain MRI (image, PDF or Word file) for tumor classification '
+        'and approximate size</div>',
         unsafe_allow_html=True,
     )
 
@@ -239,26 +432,86 @@ def classifier_page():
     scaler, mask, svm, classes = (bundle["scaler"], bundle["mask"],
                                   bundle["svm"], bundle["classes"])
 
-    uploaded = st.file_uploader("Upload a brain MRI image", type=["jpg", "jpeg", "png"])
-    if uploaded is not None:
-        img = Image.open(uploaded).convert("RGB")
-        st.image(img, caption="Uploaded MRI", use_container_width=True)
+    uploaded = st.file_uploader(
+        "Upload MRI (JPG, PNG, BMP, TIFF, WEBP, PDF, DOCX)", type=UPLOAD_TYPES)
+    if uploaded is None:
+        st.warning("For research and educational use only. Not a substitute for professional medical diagnosis.")
+        return
 
-        if st.button("Analyze", type="primary", use_container_width=True):
-            with st.spinner("Analyzing..."):
-                arr = preprocess_input(
-                    np.array(img.resize((224, 224)), dtype="float32")[None, ...])
-                feats = cnn.predict(arr, verbose=0)       # CNN features (1280)
-                X = scaler.transform(feats)[:, mask]      # ZOA-selected features
-                proba = svm.predict_proba(X)[0]           # SVM classification
-            k = int(proba.argmax())
+    try:
+        images = images_from_file(uploaded)
+    except Exception as e:
+        st.error(f"Could not read this file: {e}")
+        return
+    if not images:
+        st.error("No usable image was found in this file.")
+        return
 
+    if len(images) > 1:
+        i = st.selectbox(f"{len(images)} images found - choose one", range(len(images)),
+                         format_func=lambda x: f"Image {x + 1}")
+    else:
+        i = 0
+    img = images[i]
+    key = (uploaded.name, uploaded.size, i)
+
+    # Analyze button is at the top, right under the uploader
+    if st.button("🔍 Analyze", type="primary", use_container_width=True):
+        with st.spinner("Analyzing..."):
+            arr = preprocess_input(
+                np.array(img.resize((224, 224)), dtype="float32")[None, ...])
+            feats = cnn.predict(arr, verbose=0)       # CNN features (1280)
+            X = scaler.transform(feats)[:, mask]      # ZOA-selected features
+            proba = svm.predict_proba(X)[0]           # SVM classification
+        st.session_state["pred"] = {"key": key, "k": int(proba.argmax()), "proba": proba}
+
+    with st.expander("Size estimation settings"):
+        fov = st.slider("Approx. field of view across the image width (mm)", 150, 300, 220,
+                        help="Typical axial brain MRI covers about 200-240 mm. "
+                             "JPG/PDF files have no real scale, so this is an assumption.")
+
+    pred = st.session_state.get("pred")
+    if pred and pred["key"] != key:
+        pred = None
+
+    tumor = None
+    if pred and classes[pred["k"]] != "notumor":
+        tumor = estimate_tumor(img, fov)
+
+    col_img, col_rep = st.columns(2)
+
+    with col_img:
+        st.image(img, caption="Selected MRI image", use_container_width=True)
+        if tumor is not None:
+            st.image(tumor["overlay"], caption="Region used for size estimate (red outline)",
+                     use_container_width=True)
+
+    with col_rep:
+        st.markdown("### 📋 Analysis Report")
+        if pred is None:
+            st.info("Click **Analyze** to generate the report for this image.")
+        else:
+            k, proba = pred["k"], pred["proba"]
+            st.caption(f"File: {uploaded.name}")
             st.subheader(LABELS.get(classes[k], classes[k]))
             st.write(f"Confidence: **{proba[k] * 100:.2f}%**")
             for c, p in zip(classes, proba):
-                st.write(f"{LABELS.get(c, c)} — {p * 100:.1f}%")
+                st.write(f"{LABELS.get(c, c)} - {p * 100:.1f}%")
                 st.progress(float(p))
             st.caption(f"ZOA selected {int(mask.sum())} of {len(mask)} CNN features.")
+
+            if classes[k] != "notumor":
+                st.markdown("#### 📏 Approximate tumor size")
+                if tumor is None:
+                    st.info("A reliable size estimate could not be made from this image.")
+                else:
+                    m1, m2 = st.columns(2)
+                    m1.metric("Diameter", f"{tumor['diameter_mm']:.0f} mm",
+                              f"{tumor['diameter_mm'] / 10:.1f} cm", delta_color="off")
+                    m2.metric("Share of slice", f"{tumor['pct_brain']:.1f}%")
+                    st.write(f"Extent: **{tumor['extent_mm'][0]:.0f} x {tumor['extent_mm'][1]:.0f} mm**")
+                    st.caption("Rough estimate from a single 2D image with an assumed scale. "
+                               "Not a clinical measurement.")
 
     st.warning("For research and educational use only. Not a substitute for professional medical diagnosis.")
 
@@ -266,6 +519,9 @@ def classifier_page():
 # ---------------------------------------------------------------
 set_background()
 if "user" in st.session_state:
-    classifier_page()
+    if st.session_state.pop("show_welcome", False):
+        welcome_screen(st.session_state["user"])   # shows ~3.5 s, then reruns
+    else:
+        classifier_page()
 else:
     auth_page()
