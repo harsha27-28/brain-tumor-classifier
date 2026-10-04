@@ -127,8 +127,10 @@ def _secret(name, default=None):
         return default
 
 
-SB_URL = str(_secret("SUPABASE_URL") or "").rstrip("/")
-SB_KEY = str(_secret("SUPABASE_KEY") or "")
+SB_URL = str(_secret("SUPABASE_URL") or "").strip().rstrip("/")
+if SB_URL.endswith("/rest/v1"):
+    SB_URL = SB_URL[: -len("/rest/v1")]
+SB_KEY = str(_secret("SUPABASE_KEY") or "").strip()
 USE_SUPABASE = bool(SB_URL and SB_KEY)
 
 
@@ -176,7 +178,7 @@ def store_create_user(full_name, username, email, salt, pw_hash):
             return True, ""
         if r.status_code == 409:
             return False, "That username or email is already registered."
-        return False, f"Database error ({r.status_code}). Please try again."
+        return False, f"Database error ({r.status_code}): {r.text[:200]}"
     try:
         with get_conn() as conn:
             conn.execute(
@@ -306,6 +308,7 @@ def auth_page():
                     st.session_state["user"] = row["full_name"]
                     st.session_state["username"] = row["username"]
                     st.session_state["show_welcome"] = True
+                    st.session_state["page"] = PAGE_DASH
                     st.rerun()
                 else:
                     store_log(u.strip().lower()[:50], "login_failed")
@@ -355,6 +358,7 @@ def load_models():
 # Reading uploaded files: images, PDF, Word (.docx)
 # ---------------------------------------------------------------
 UPLOAD_TYPES = ["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp", "pdf", "docx", "doc"]
+FOV_MM = 220       # assumed field of view across the image width (mm)
 MIN_SIDE = 64      # ignore tiny images such as logos/icons
 MAX_IMAGES = 12
 
@@ -485,6 +489,10 @@ def estimate_tumor(img, fov_mm):
     }
 
 
+PAGE_DASH = "🏠 Dashboard"
+PAGE_SCAN = "🧠 MRI Scan"
+
+
 # ---------------------------------------------------------------
 # Full-screen glittering welcome (shown once right after sign in)
 # ---------------------------------------------------------------
@@ -544,56 +552,77 @@ def welcome_screen(name):
 # ---------------------------------------------------------------
 # Classifier page (shown after login)
 # ---------------------------------------------------------------
-def admin_panel():
-    """Usage statistics, protected by ADMIN_PASSWORD (set in Streamlit secrets)."""
+def usage_statistics():
+    """Usage statistics for the dashboard, protected by ADMIN_PASSWORD (Streamlit secrets)."""
     admin_pw = _secret("ADMIN_PASSWORD")
     if not admin_pw:
         return
-    with st.expander("🔒 Admin - usage statistics"):
+    st.markdown("### 📊 Usage statistics")
+    if not st.session_state.get("admin_ok"):
         entered = st.text_input("Admin password", type="password", key="admin_pw")
         if not entered:
             return
         if not hmac.compare_digest(entered, str(admin_pw)):
             st.error("Wrong admin password.")
             return
-        try:
-            s = store_stats()
-            rows = store_recent(100)
-        except Exception:
-            st.error("Could not read statistics from the database.")
-            return
-        if not USE_SUPABASE:
-            st.warning("Temporary storage: these numbers reset when the app restarts.")
-        c1, c2 = st.columns(2)
-        c1.metric("Registered users", s["users"])
-        c2.metric("Total logins", s["logins"])
-        c3, c4 = st.columns(2)
-        c3.metric("Unique users who logged in", s["unique_logins"])
-        c4.metric("Scans analysed", s["analyses"])
-        if rows:
-            import pandas as pd
-            df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True)
-            st.download_button("Download log (CSV)", df.to_csv(index=False).encode(),
-                               "usage_log.csv", "text/csv")
+        st.session_state["admin_ok"] = True
+    try:
+        s = store_stats()
+        rows = store_recent(100)
+    except Exception:
+        st.error("Could not read statistics from the database.")
+        return
+    if not USE_SUPABASE:
+        st.warning("Temporary storage: these numbers reset when the app restarts.")
+    c1, c2 = st.columns(2)
+    c1.metric("Registered users", s["users"])
+    c2.metric("Total logins", s["logins"])
+    c3, c4 = st.columns(2)
+    c3.metric("Unique users who logged in", s["unique_logins"])
+    c4.metric("Scans analysed", s["analyses"])
+    if rows:
+        import pandas as pd
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True)
+        st.download_button("Download log (CSV)", df.to_csv(index=False).encode(),
+                           "usage_log.csv", "text/csv")
+
+
+def go_to_scan():
+    st.session_state["page"] = PAGE_SCAN
+
+
+def dashboard_page():
+    st.markdown("### 🏠 Dashboard")
+    st.write("Upload a brain MRI to get the tumor classification, an approximate tumor size "
+             "and a report you can share with your doctor.")
+    st.button("➕ Start a new MRI scan", type="primary", use_container_width=True,
+              on_click=go_to_scan)
+    usage_statistics()
+
+
+def app_shell():
+    """Header + navigation shown after login."""
+    _, top_r = st.columns([4, 1])
+    with top_r:
+        if st.button("Log out", use_container_width=True):
+            for k_ in ("user", "username", "pred", "page", "admin_ok"):
+                st.session_state.pop(k_, None)
+            st.rerun()
+    st.markdown('<div class="brand"><h1>🧠 MRI NeuroScan AI</h1></div>', unsafe_allow_html=True)
+    st.markdown('<div class="tagline">Brain tumor MRI classification · CNN + ZOA + SVM</div>',
+                unsafe_allow_html=True)
+    st.session_state.setdefault("page", PAGE_DASH)
+    page = st.radio("Navigation", [PAGE_DASH, PAGE_SCAN], key="page",
+                    horizontal=True, label_visibility="collapsed")
+    if page == PAGE_DASH:
+        dashboard_page()
+    else:
+        classifier_page()
 
 
 def classifier_page():
     from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-
-    _, top_r = st.columns([4, 1])
-    with top_r:
-        if st.button("Log out", use_container_width=True):
-            for k_ in ("user", "username", "pred"):
-                st.session_state.pop(k_, None)
-            st.rerun()
-
-    st.markdown('<div class="brand"><h1>🧠 MRI NeuroScan AI</h1></div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="tagline">Upload a brain MRI (image, PDF or Word file) for tumor classification '
-        'and approximate size</div>',
-        unsafe_allow_html=True,
-    )
 
     bundle, cnn = load_models()
     scaler, mask, svm, classes = (bundle["scaler"], bundle["mask"],
@@ -603,7 +632,6 @@ def classifier_page():
         "Upload MRI (JPG, PNG, BMP, TIFF, WEBP, PDF, DOCX)", type=UPLOAD_TYPES)
     if uploaded is None:
         st.warning("For research and educational use only. Not a substitute for professional medical diagnosis.")
-        admin_panel()
         return
 
     try:
@@ -636,10 +664,7 @@ def classifier_page():
         store_log(st.session_state.get("username", ""), "analysis",
                   f"{LABELS.get(classes[kk], classes[kk])} {proba[kk] * 100:.1f}%")
 
-    with st.expander("Size estimation settings"):
-        fov = st.slider("Approx. field of view across the image width (mm)", 150, 300, 220,
-                        help="Typical axial brain MRI covers about 200-240 mm. "
-                             "JPG/PDF files have no real scale, so this is an assumption.")
+    fov = FOV_MM
 
     pred = st.session_state.get("pred")
     if pred and pred["key"] != key:
@@ -697,7 +722,6 @@ def classifier_page():
                            "vision problems, please consult a doctor.")
 
     st.warning("For research and educational use only. Not a substitute for professional medical diagnosis.")
-    admin_panel()
 
 
 # ---------------------------------------------------------------
@@ -706,6 +730,6 @@ if "user" in st.session_state:
     if st.session_state.pop("show_welcome", False):
         welcome_screen(st.session_state["user"])   # shows ~3.5 s, then reruns
     else:
-        classifier_page()
+        app_shell()
 else:
     auth_page()
