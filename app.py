@@ -4,6 +4,7 @@ import random
 import re
 import time
 import zipfile
+from datetime import datetime, timedelta, timezone
 import base64
 import hashlib
 import hmac
@@ -13,6 +14,7 @@ from urllib.parse import quote
 
 import joblib
 import numpy as np
+import requests
 import streamlit as st
 from PIL import Image
 
@@ -112,22 +114,140 @@ def set_background():
 
 
 # ---------------------------------------------------------------
-# User accounts (SQLite + salted PBKDF2 password hashing)
+# Storage: Supabase (permanent) when configured, otherwise SQLite (temporary)
+# Accounts + login/usage events are stored here.
 # ---------------------------------------------------------------
 DB_PATH = "users.db"
+
+
+def _secret(name, default=None):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+SB_URL = str(_secret("SUPABASE_URL") or "").rstrip("/")
+SB_KEY = str(_secret("SUPABASE_KEY") or "")
+USE_SUPABASE = bool(SB_URL and SB_KEY)
+
+
+def _sb(method, table, params=None, json=None, headers=None):
+    h = {"apikey": SB_KEY, "Content-Type": "application/json"}
+    if SB_KEY.startswith("eyJ"):                 # legacy JWT-style keys also need Authorization
+        h["Authorization"] = f"Bearer {SB_KEY}"
+    if headers:
+        h.update(headers)
+    return requests.request(method, f"{SB_URL}/rest/v1/{table}",
+                            params=params, json=json, headers=h, timeout=15)
+
+
+def _sb_count(table, filters=None):
+    params = {"select": "username", "limit": "1"}
+    if filters:
+        params.update(filters)
+    r = _sb("GET", table, params=params, headers={"Prefer": "count=exact"})
+    r.raise_for_status()
+    return int(r.headers.get("Content-Range", "*/0").split("/")[-1])
 
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS users (
-               username TEXT PRIMARY KEY,
-               email TEXT UNIQUE NOT NULL,
-               full_name TEXT NOT NULL,
-               salt TEXT NOT NULL,
-               pw_hash TEXT NOT NULL)"""
+               username TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL,
+               full_name TEXT NOT NULL, salt TEXT NOT NULL, pw_hash TEXT NOT NULL,
+               created_at TEXT DEFAULT CURRENT_TIMESTAMP)"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS events (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, event TEXT,
+               detail TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"""
     )
     return conn
+
+
+def store_create_user(full_name, username, email, salt, pw_hash):
+    if USE_SUPABASE:
+        r = _sb("POST", "users", headers={"Prefer": "return=minimal"},
+                json={"username": username, "email": email, "full_name": full_name,
+                      "salt": salt, "pw_hash": pw_hash})
+        if r.status_code in (200, 201, 204):
+            return True, ""
+        if r.status_code == 409:
+            return False, "That username or email is already registered."
+        return False, f"Database error ({r.status_code}). Please try again."
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO users (username,email,full_name,salt,pw_hash) VALUES (?,?,?,?,?)",
+                (username, email, full_name, salt, pw_hash))
+        return True, ""
+    except sqlite3.IntegrityError:
+        return False, "That username or email is already registered."
+
+
+def store_find_user(ident):
+    if USE_SUPABASE:
+        for col in ("username", "email"):
+            r = _sb("GET", "users", params={col: f"eq.{ident}", "limit": "1",
+                                            "select": "username,full_name,salt,pw_hash"})
+            r.raise_for_status()
+            data = r.json()
+            if data:
+                return data[0]
+        return None
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT username, full_name, salt, pw_hash FROM users WHERE username=? OR email=?",
+            (ident, ident)).fetchone()
+    return dict(zip(("username", "full_name", "salt", "pw_hash"), row)) if row else None
+
+
+def store_log(username, event, detail=""):
+    """Record signup / login / login_failed / analysis events (never breaks the app)."""
+    try:
+        if USE_SUPABASE:
+            _sb("POST", "events", headers={"Prefer": "return=minimal"},
+                json={"username": username, "event": event, "detail": detail[:200]})
+        else:
+            with get_conn() as conn:
+                conn.execute("INSERT INTO events (username,event,detail) VALUES (?,?,?)",
+                             (username, event, detail[:200]))
+    except Exception:
+        pass
+
+
+def store_stats():
+    if USE_SUPABASE:
+        r = _sb("GET", "events", params={"select": "username", "event": "eq.login", "limit": "10000"})
+        r.raise_for_status()
+        return {
+            "users": _sb_count("users"),
+            "logins": _sb_count("events", {"event": "eq.login"}),
+            "unique_logins": len({x["username"] for x in r.json()}),
+            "analyses": _sb_count("events", {"event": "eq.analysis"}),
+        }
+    with get_conn() as c:
+        return {
+            "users": c.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+            "logins": c.execute("SELECT COUNT(*) FROM events WHERE event='login'").fetchone()[0],
+            "unique_logins": c.execute(
+                "SELECT COUNT(DISTINCT username) FROM events WHERE event='login'").fetchone()[0],
+            "analyses": c.execute("SELECT COUNT(*) FROM events WHERE event='analysis'").fetchone()[0],
+        }
+
+
+def store_recent(limit=100):
+    if USE_SUPABASE:
+        r = _sb("GET", "events", params={"select": "created_at,username,event,detail",
+                                         "order": "created_at.desc", "limit": str(limit)})
+        r.raise_for_status()
+        return r.json()
+    with get_conn() as c:
+        rows = c.execute("SELECT created_at, username, event, detail FROM events "
+                         "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(zip(("created_at", "username", "event", "detail"), x)) for x in rows]
 
 
 def hash_pw(password, salt_hex):
@@ -139,26 +259,21 @@ def hash_pw(password, salt_hex):
 def create_user(full_name, username, email, password):
     salt = secrets.token_hex(16)
     try:
-        with get_conn() as conn:
-            conn.execute(
-                "INSERT INTO users VALUES (?,?,?,?,?)",
-                (username.lower(), email.lower(), full_name, salt, hash_pw(password, salt)),
-            )
+        ok, msg = store_create_user(full_name, username.lower(), email.lower(),
+                                    salt, hash_pw(password, salt))
+    except Exception:
+        return False, "Could not reach the database. Please try again in a moment."
+    if ok:
+        store_log(username.lower(), "signup")
         return True, "Account created! Please sign in."
-    except sqlite3.IntegrityError:
-        return False, "That username or email is already registered."
+    return False, msg
 
 
 def verify_user(identifier, password):
-    """identifier can be the username or the email address."""
-    ident = identifier.strip().lower()
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT salt, pw_hash, full_name FROM users WHERE username=? OR email=?",
-            (ident, ident),
-        ).fetchone()
-    if row and hmac.compare_digest(hash_pw(password, row[0]), row[1]):
-        return row[2]
+    """identifier = username OR email. Returns the user row if the password is right."""
+    row = store_find_user(identifier.strip().lower())
+    if row and hmac.compare_digest(hash_pw(password, row["salt"]), row["pw_hash"]):
+        return row
     return None
 
 
@@ -171,6 +286,8 @@ def auth_page():
         '<div class="tagline">Brain tumor MRI classification · CNN + ZOA + SVM</div>',
         unsafe_allow_html=True,
     )
+    if not USE_SUPABASE:
+        st.caption("⚠ Temporary storage mode: accounts are erased whenever the app restarts.")
     tab_in, tab_up = st.tabs(["🔐 Sign In", "📝 Sign Up"])
 
     with tab_in:
@@ -179,13 +296,20 @@ def auth_page():
             p = st.text_input("Password", type="password")
             go = st.form_submit_button("Sign In", use_container_width=True)
         if go:
-            name = verify_user(u.strip(), p) if u.strip() and p else None
-            if name:
-                st.session_state["user"] = name
-                st.session_state["show_welcome"] = True
-                st.rerun()
+            try:
+                row = verify_user(u, p) if u.strip() and p else None
+            except Exception:
+                st.error("Could not reach the database. Please try again in a moment.")
             else:
-                st.error("Invalid username/email or password.")
+                if row:
+                    store_log(row["username"], "login")
+                    st.session_state["user"] = row["full_name"]
+                    st.session_state["username"] = row["username"]
+                    st.session_state["show_welcome"] = True
+                    st.rerun()
+                else:
+                    store_log(u.strip().lower()[:50], "login_failed")
+                    st.error("Invalid username/email or password.")
 
     with tab_up:
         with st.form("signup"):
@@ -340,10 +464,19 @@ def estimate_tumor(img, fov_mm):
     ext_y = (sl[0].stop - sl[0].start) * mm_y
     ext_x = (sl[1].stop - sl[1].start) * mm_x
 
+    # length = longest axis, width = perpendicular axis (ellipse fitted to the region)
+    ys, xs = np.nonzero(comp)
+    pts = np.stack([xs * mm_x, ys * mm_y], axis=1)
+    ev = np.sort(np.linalg.eigvalsh(np.cov(pts.T)))[::-1]
+    length = 4.0 * np.sqrt(max(ev[0], 0.0))
+    width = 4.0 * np.sqrt(max(ev[1], 0.0))
+
     base = np.asarray(img.resize((N, N)).convert("RGB")).copy()
     edge = comp & ~ndi.binary_erosion(comp, iterations=2)
     base[edge] = [255, 60, 60]
     return {
+        "length_mm": float(length),
+        "width_mm": float(width),
         "diameter_mm": float(diameter),
         "extent_mm": (float(ext_x), float(ext_y)),
         "area_mm2": float(area_mm2),
@@ -411,14 +544,48 @@ def welcome_screen(name):
 # ---------------------------------------------------------------
 # Classifier page (shown after login)
 # ---------------------------------------------------------------
+def admin_panel():
+    """Usage statistics, protected by ADMIN_PASSWORD (set in Streamlit secrets)."""
+    admin_pw = _secret("ADMIN_PASSWORD")
+    if not admin_pw:
+        return
+    with st.expander("🔒 Admin - usage statistics"):
+        entered = st.text_input("Admin password", type="password", key="admin_pw")
+        if not entered:
+            return
+        if not hmac.compare_digest(entered, str(admin_pw)):
+            st.error("Wrong admin password.")
+            return
+        try:
+            s = store_stats()
+            rows = store_recent(100)
+        except Exception:
+            st.error("Could not read statistics from the database.")
+            return
+        if not USE_SUPABASE:
+            st.warning("Temporary storage: these numbers reset when the app restarts.")
+        c1, c2 = st.columns(2)
+        c1.metric("Registered users", s["users"])
+        c2.metric("Total logins", s["logins"])
+        c3, c4 = st.columns(2)
+        c3.metric("Unique users who logged in", s["unique_logins"])
+        c4.metric("Scans analysed", s["analyses"])
+        if rows:
+            import pandas as pd
+            df = pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True)
+            st.download_button("Download log (CSV)", df.to_csv(index=False).encode(),
+                               "usage_log.csv", "text/csv")
+
+
 def classifier_page():
     from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 
     _, top_r = st.columns([4, 1])
     with top_r:
         if st.button("Log out", use_container_width=True):
-            st.session_state.pop("user", None)
-            st.session_state.pop("pred", None)
+            for k_ in ("user", "username", "pred"):
+                st.session_state.pop(k_, None)
             st.rerun()
 
     st.markdown('<div class="brand"><h1>🧠 MRI NeuroScan AI</h1></div>', unsafe_allow_html=True)
@@ -436,6 +603,7 @@ def classifier_page():
         "Upload MRI (JPG, PNG, BMP, TIFF, WEBP, PDF, DOCX)", type=UPLOAD_TYPES)
     if uploaded is None:
         st.warning("For research and educational use only. Not a substitute for professional medical diagnosis.")
+        admin_panel()
         return
 
     try:
@@ -463,7 +631,10 @@ def classifier_page():
             feats = cnn.predict(arr, verbose=0)       # CNN features (1280)
             X = scaler.transform(feats)[:, mask]      # ZOA-selected features
             proba = svm.predict_proba(X)[0]           # SVM classification
-        st.session_state["pred"] = {"key": key, "k": int(proba.argmax()), "proba": proba}
+        kk = int(proba.argmax())
+        st.session_state["pred"] = {"key": key, "k": kk, "proba": proba}
+        store_log(st.session_state.get("username", ""), "analysis",
+                  f"{LABELS.get(classes[kk], classes[kk])} {proba[kk] * 100:.1f}%")
 
     with st.expander("Size estimation settings"):
         fov = st.slider("Approx. field of view across the image width (mm)", 150, 300, 220,
@@ -492,7 +663,9 @@ def classifier_page():
             st.info("Click **Analyze** to generate the report for this image.")
         else:
             k, proba = pred["k"], pred["proba"]
-            st.caption(f"File: {uploaded.name}")
+            ist = timezone(timedelta(hours=5, minutes=30))
+            st.caption(f"File: {uploaded.name}  |  Generated: "
+                       f"{datetime.now(ist).strftime('%d %b %Y, %I:%M %p')} IST")
             st.subheader(LABELS.get(classes[k], classes[k]))
             st.write(f"Confidence: **{proba[k] * 100:.2f}%**")
             for c, p in zip(classes, proba):
@@ -501,19 +674,30 @@ def classifier_page():
             st.caption(f"ZOA selected {int(mask.sum())} of {len(mask)} CNN features.")
 
             if classes[k] != "notumor":
-                st.markdown("#### 📏 Approximate tumor size")
+                st.markdown("#### 📏 Tumor size (approximate)")
                 if tumor is None:
-                    st.info("A reliable size estimate could not be made from this image.")
+                    st.warning("Tumor detected, but its size could not be estimated "
+                               "from this image.")
                 else:
                     m1, m2 = st.columns(2)
-                    m1.metric("Diameter", f"{tumor['diameter_mm']:.0f} mm",
-                              f"{tumor['diameter_mm'] / 10:.1f} cm", delta_color="off")
-                    m2.metric("Share of slice", f"{tumor['pct_brain']:.1f}%")
-                    st.write(f"Extent: **{tumor['extent_mm'][0]:.0f} x {tumor['extent_mm'][1]:.0f} mm**")
-                    st.caption("Rough estimate from a single 2D image with an assumed scale. "
-                               "Not a clinical measurement.")
+                    m1.metric("Length", f"{tumor['length_mm']:.1f} mm",
+                              f"{tumor['length_mm'] / 10:.2f} cm", delta_color="off")
+                    m2.metric("Width", f"{tumor['width_mm']:.1f} mm",
+                              f"{tumor['width_mm'] / 10:.2f} cm", delta_color="off")
+                    st.caption("Length = longest dimension, width = perpendicular dimension. "
+                               "Estimated from a single 2D image with an assumed scale, "
+                               "so it is approximate, not a clinical measurement.")
+                st.info("🩺 **Important:** This is an automated screening result, not a diagnosis. "
+                        "Please share this report with a doctor (neurologist, neurosurgeon or "
+                        "radiologist). The doctor will confirm the findings on the original scans "
+                        "and decide the required tests, treatment and precautions.")
+            else:
+                st.success("✅ No tumor was detected in this image. This does not replace a medical "
+                           "opinion - if you have symptoms such as persistent headache, seizures or "
+                           "vision problems, please consult a doctor.")
 
     st.warning("For research and educational use only. Not a substitute for professional medical diagnosis.")
+    admin_panel()
 
 
 # ---------------------------------------------------------------
