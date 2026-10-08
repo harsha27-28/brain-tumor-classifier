@@ -283,7 +283,7 @@ def verify_user(identifier, password):
 # Sign in / Sign up page
 # ---------------------------------------------------------------
 def auth_page():
-    st.markdown('<div class="brand"><h1>🧠 MRI NeuroScan AI</h1></div>', unsafe_allow_html=True)
+    st.markdown('<div class="brand"><h1>🧠 MRI NeuroScan </h1></div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="tagline">Brain tumor MRI classification · CNN + ZOA + SVM</div>',
         unsafe_allow_html=True,
